@@ -1,0 +1,23 @@
+# Connect IQ outputs
+bin/
+*.prg
+*.debug.xml
+
+# Garmin Developer Key (Do not publish!)
+developer_key.der
+
+# IDE / Project settings
+.project
+.settings/
+.classpath
+.metadata/
+.vs/
+.vscode/
+
+# Local agent artifacts and logs
+task.md
+walkthrough.md
+implementation_plan.md
+scratch/
+.system_generated/
+*.log

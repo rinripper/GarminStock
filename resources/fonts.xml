@@ -1,0 +1,3 @@
+<resources>
+    <font id="tiny_countdown_font" filename="fonts/tiny_countdown.fnt" filter="0123456789" />
+</resources>

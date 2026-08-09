@@ -1,0 +1,5 @@
+<resources>
+    <layout id="WatchFace">
+        <!-- Empty layout. All rendering is done dynamically in GarminStockView.mc for pixel-perfect positioning and memory saving -->
+    </layout>
+</resources>
