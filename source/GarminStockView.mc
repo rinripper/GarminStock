@@ -21,6 +21,13 @@ class GarminStockView extends WatchUi.WatchFace {
     private var _postEnd as Number or Null = null;
     private var _countdownFont = null;
 
+    // Constant geometry/metrics cached at layout time to keep the per-second onUpdate light
+    private var _subCenterX as Number = 144;
+    private var _subCenterY as Number = 31;
+    private var _fhThaiHot as Number = 0;
+    private var _fhLarge as Number = 0;
+    private var _is24Hour as Boolean = true;
+
     function initialize() {
         WatchFace.initialize();
         loadStockData();
@@ -168,10 +175,55 @@ class GarminStockView extends WatchUi.WatchFace {
         return targetMoment.value() - offset;
     }
 
+    // Draw the volume/direction indicator below the price.
+    // state: 0 = flat bar, +1/-1 = single up/down arrow, +2/-2 = double up/down arrow.
+    function drawMoveArrows(dc as Dc, cx as Number, cy as Number, state as Number) as Void {
+        dc.setColor(Graphics.COLOR_WHITE, Graphics.COLOR_TRANSPARENT);
+        if (state == 0) {
+            dc.fillRectangle(cx - 5, cy - 1, 10, 2); // flat: short horizontal bar
+            return;
+        }
+        var up = (state > 0);
+        var count = (state == 2 || state == -2) ? 2 : 1;
+        var tw = 10;
+        var th = 8;
+        var gap = 3;
+        var totalW = count * tw + (count - 1) * gap;
+        var startX = cx - (totalW / 2);
+        for (var k = 0; k < count; k++) {
+            drawTriangle(dc, startX + k * (tw + gap), cy - (th / 2), tw, th, up);
+        }
+    }
+
+    // Filled triangle drawn with horizontal scanlines (avoids the fillPolygon dependency).
+    function drawTriangle(dc as Dc, x as Number, y as Number, w as Number, h as Number, up as Boolean) as Void {
+        var cxT = x + (w / 2);
+        for (var i = 0; i < h; i++) {
+            var frac = (h > 1) ? (i.toFloat() / (h - 1)) : 1.0;
+            var hw;
+            if (up) {
+                hw = (frac * (w / 2.0)).toNumber();          // apex at top
+            } else {
+                hw = ((1.0 - frac) * (w / 2.0)).toNumber();  // apex at bottom
+            }
+            dc.drawLine(cxT - hw, y + i, cxT + hw, y + i);
+        }
+    }
+
     // Load resources
     function onLayout(dc as Dc) as Void {
         setLayout(Rez.Layouts.WatchFace(dc));
         _countdownFont = WatchUi.loadResource(Rez.Fonts.tiny_countdown_font);
+
+        // Cache constant geometry and font metrics so onUpdate does not recompute them every second
+        var subscreen = (WatchUi has :getSubscreen) ? WatchUi.getSubscreen() : null;
+        if (subscreen != null) {
+            _subCenterX = subscreen.x + (subscreen.width / 2);
+            _subCenterY = subscreen.y + (subscreen.height / 2);
+        }
+        _fhThaiHot = dc.getFontHeight(Graphics.FONT_NUMBER_THAI_HOT);
+        _fhLarge = dc.getFontHeight(Graphics.FONT_LARGE);
+        _is24Hour = System.getDeviceSettings().is24Hour;
     }
 
     // Called when this View is brought to the foreground.
@@ -205,6 +257,9 @@ class GarminStockView extends WatchUi.WatchFace {
 
 
 
+        // Market open/closed is decided once per frame and reused (graph vs countdown, sub-lens arrows)
+        var marketClosed = isMarketClosed(nowSeconds);
+
         // 3. Draw Stock Line Graph (Top-Left Box) or Countdown Timer if market is closed
         // Bounding box: x = 10, y = 16, width = 90, height = 26
         var graphX = 10;
@@ -212,7 +267,7 @@ class GarminStockView extends WatchUi.WatchFace {
         var graphW = 90;
         var graphH = 26;
 
-        if (isMarketClosed(nowSeconds)) {
+        if (marketClosed) {
             drawCountdownTimer(dc, nowSeconds);
         } else {
             if (chartData != null && chartData.size() > 0) {
@@ -272,23 +327,11 @@ class GarminStockView extends WatchUi.WatchFace {
             }
         }
 
-        // 5. Draw BPM inside the top-right circular subscreen
-        var subscreen = (WatchUi has :getSubscreen) ? WatchUi.getSubscreen() : null;
-        var subX = 120;
-        var subY = 8;
-        var subW = 48;
-        var subH = 48;
-
-        if (subscreen != null) {
-            subX = subscreen.x;
-            subY = subscreen.y;
-            subW = subscreen.width;
-            subH = subscreen.height;
-        }
-
-        var subCenterX = subX + (subW / 2);
-        var subCenterY = subY + (subH / 2);
-        var subRadius = (subW < subH ? subW : subH) / 2;
+        // Sub-lens content centered on the cached lens center (getSubscreen read once in onLayout).
+        // Simulator pixel inspector puts the lens center at (x=145, y=31); the countdown and volume
+        // arrows sit symmetrically 20px above/below the price.
+        var subContentX = _subCenterX + 1; // 144 -> 145
+        var subContentY = _subCenterY;     // 31 = circle center
 
         // Query Heart Rate
         var heartRate = null;
@@ -319,42 +362,50 @@ class GarminStockView extends WatchUi.WatchFace {
             }
         }
 
-        // Draw stock price without decimal in the subscreen (circle) (or "--" if no data/offline)
-        var priceIntString = "--";
-        var priceFont = Graphics.FONT_LARGE;
-        if (price != null) {
-            priceIntString = price.toNumber().toString();
-            priceFont = Graphics.FONT_NUMBER_MILD;
-            if (priceIntString.length() >= 4) {
-                priceFont = Graphics.FONT_LARGE;
+        // Read momentum state for the volume/direction arrows (-2..2)
+        var moveState = 0;
+        if (_stockData != null) {
+            var moveDict = _stockData as Dictionary;
+            if (moveDict.hasKey("move") && moveDict["move"] != null) {
+                moveState = moveDict["move"] as Number;
             }
         }
-        
-        // Shift price slightly up to make room for the countdown text below it
-        dc.drawText(
-            subCenterX, 
-            subCenterY - 6, 
-            priceFont, 
-            priceIntString, 
-            Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER
-        );
-        
-        // Draw the countdown to the next update (in seconds) below the price (only when market is open)
-        if (!isMarketClosed(nowSeconds) && countdownString.length() > 0) {
-            var font = _countdownFont != null ? _countdownFont : Graphics.FONT_XTINY;
+
+        var marketOpenNow = !marketClosed;
+
+        // --- Circle line 1 (top): 5-minute sample countdown (only while market is open) ---
+        if (marketOpenNow && countdownString.length() > 0) {
+            var cdFont = _countdownFont != null ? _countdownFont : Graphics.FONT_XTINY;
             dc.drawText(
-                subCenterX, 
-                subCenterY + 12, 
-                font, 
-                countdownString, 
+                subContentX,
+                subContentY - 20,
+                cdFont,
+                countdownString,
                 Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER
             );
+        }
+
+        // --- Circle line 2 (center): last price without decimals (or "--" if no data/offline) ---
+        var priceIntString = "--";
+        if (price != null) {
+            priceIntString = price.toNumber().toString();
+        }
+        dc.drawText(
+            subContentX,
+            subContentY,
+            Graphics.FONT_LARGE,
+            priceIntString,
+            Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER
+        );
+
+        // --- Circle line 3 (bottom): volume/direction arrows (only while market is open) ---
+        if (marketOpenNow) {
+            drawMoveArrows(dc, subContentX, subContentY + 20, moveState);
         }
         // 6. Draw central Time display (Always show seconds HH:MM:SS centered, aligned to the baseline/floor)
         var clockTime = System.getClockTime();
         var hours = clockTime.hour;
-        var settings = System.getDeviceSettings();
-        if (!settings.is24Hour) {
+        if (!_is24Hour) {
             if (hours > 12) {
                 hours = hours - 12;
             } else if (hours == 0) {
@@ -377,8 +428,8 @@ class GarminStockView extends WatchUi.WatchFace {
 
         var startX = 12;
 
-        var heightHM = dc.getFontHeight(fontHM);
-        var heightS = dc.getFontHeight(fontS);
+        var heightHM = _fhThaiHot;
+        var heightS = _fhLarge;
 
         // Center the combined block vertically at y = 96 (shifted down to be well below the circle bottom)
         var yHM = 96 - (heightHM / 2);

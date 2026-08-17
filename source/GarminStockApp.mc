@@ -51,58 +51,81 @@ class GarminStockApp extends Application.AppBase {
 
     // Handle data returned from the background ServiceDelegate
     function onBackgroundData(data) as Void {
-        System.println("onBackgroundData called with data: " + data);
-        Application.Storage.setValue("stock_data", data);
-        Application.Storage.setValue("last_update_time", Time.now().value());
-        
-        if (_view != null) {
-            _view.handleBackgroundUpdate(data);
+        // Keep the last good price instead of reverting. Once after-hours ends (8pm ET) a fresh poll
+        // comes back either with an empty extended-hours window ("time" == null) or the regular 4pm
+        // close (an older timestamp). In both cases we retain the last after-hours price; a genuinely
+        // newer bar (e.g. next day's pre-market) has a newer timestamp and is accepted normally.
+        var accept = true;
+        if (data != null) {
+            var dict = data as Dictionary;
+            var newTime = dict.hasKey("time") ? dict.get("time") : null;
+            var oldData = Application.Storage.getValue("stock_data");
+            var oldTime = null;
+            if (oldData != null) {
+                var od = oldData as Dictionary;
+                if (od.hasKey("time")) { oldTime = od.get("time"); }
+            }
+            if (newTime == null) {
+                accept = (oldData == null);
+            } else if (oldTime != null && (newTime as Number) < (oldTime as Number)) {
+                accept = false;
+            }
+        }
+
+        if (accept) {
+            Application.Storage.setValue("stock_data", data);
+            Application.Storage.setValue("last_update_time", Time.now().value());
+            if (_view != null) {
+                _view.handleBackgroundUpdate(data);
+            }
         }
 
         // Dynamically adjust the background schedule to save battery
         adjustBackgroundSchedule(data);
-        
+
         // Force the screen to redraw immediately
         WatchUi.requestUpdate();
     }
 
     function adjustBackgroundSchedule(data) as Void {
-        if (System has :ServiceDelegate) {
-            var regStart = null;
-            var postEnd = null;
-            if (data != null) {
-                var dict = data as Dictionary;
-                if (dict.hasKey("reg_start")) { regStart = dict["reg_start"] as Number; }
-                if (dict.hasKey("post_end")) { postEnd = dict["post_end"] as Number; }
-            }
+        if (!(System has :ServiceDelegate)) { return; }
 
-            var now = Time.now().value();
-            var nextPremarket = null;
-            if (regStart != null) {
-                nextPremarket = regStart - 19800; // 5.5 hours before regular open (4:00 AM EDT)
-            }
+        var regStart = null;
+        var postEnd = null;
+        if (data != null) {
+            var dict = data as Dictionary;
+            if (dict.hasKey("reg_start")) { regStart = dict["reg_start"] as Number; }
+            if (dict.hasKey("post_end")) { postEnd = dict["post_end"] as Number; }
+        }
 
-            // Determine if the market is currently active (including overnight)
-            var isMarketActive = false;
-            if (regStart != null && postEnd != null) {
-                var overnightStart = regStart - 48600; // 13.5 hours before regular open
-                if (now >= overnightStart && now <= postEnd) {
-                    isMarketActive = true;
-                }
-            }
+        var now = Time.now().value();
 
-            if (!isMarketActive && nextPremarket != null && nextPremarket > now) {
-                var delay = nextPremarket - now;
-                if (delay > 300) {
-                    System.println("Market is closed. Sleeping background delegate for " + delay + " seconds until next pre-market open.");
-                    Background.registerForTemporalEvent(new Time.Duration(delay));
-                    return;
-                }
-            }
-
-            // Fallback/standard: poll every 5 minutes (300 seconds)
-            System.println("Market is active or next session is soon. Scheduling next check in 5 minutes.");
+        // Without trading-period metadata we can't tell open from closed: keep the 5-minute cadence.
+        if (regStart == null || postEnd == null) {
             Background.registerForTemporalEvent(new Time.Duration(5 * 60));
+            return;
+        }
+
+        // A stock's active window is pre-market open (~4:00 AM ET = regular open - 5.5h) through
+        // post-market end (8:00 PM ET), so pre-market AND after-hours keep polling. Yahoo's
+        // currentTradingPeriod already points at the next *real* trading day, so weekends and holidays
+        // are skipped automatically — we only compare absolute epoch times here, no local-timezone
+        // calendar math (which would break when the watch is not set to Eastern time).
+        var activeStart = regStart - 19800;
+
+        if (now >= activeStart && now <= postEnd) {
+            // Pre-market, regular, or after-hours: poll every 5 minutes.
+            Background.registerForTemporalEvent(new Time.Duration(5 * 60));
+        } else if (now < activeStart) {
+            // Closed, and the metadata already points at the upcoming session: sleep straight through
+            // until pre-market open — zero network calls overnight, over weekends, and on holidays.
+            var delay = activeStart - now;
+            if (delay < 300) { delay = 300; }
+            Background.registerForTemporalEvent(new Time.Duration(delay));
+        } else {
+            // now > postEnd: after-hours just ended but Yahoo hasn't rolled currentTradingPeriod to the
+            // next session yet. Re-check in an hour; once it rolls, the branch above sleeps to next open.
+            Background.registerForTemporalEvent(new Time.Duration(3600));
         }
     }
 }

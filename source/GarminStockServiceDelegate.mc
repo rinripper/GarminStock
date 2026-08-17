@@ -4,15 +4,18 @@ import Toybox.Communications;
 import Toybox.Lang;
 import Toybox.Math;
 
+// Momentum indicator thresholds (tunable). Direction comes from price, strength from volume.
 (:background)
-const PUSHOVER_APP_TOKEN = "YOUR_PUSHOVER_APP_TOKEN";
+const MOVE_FLAT_THRESH = 0.0015; // <0.15% price change over the window => flat (bar)
 (:background)
-const PUSHOVER_USER_KEY  = "YOUR_PUSHOVER_USER_KEY";
+const MOVE_STRONG_PX   = 0.007;  // >=0.7% price change => strong move (double arrow)
+(:background)
+const MOVE_STRONG_VOL  = 1.8;    // recent volume >=1.8x session avg => strong move
+(:background)
+const MOVE_LOOKBACK    = 10;     // bars (~minutes) back to measure the price change
 
 (:background)
 class GarminStockServiceDelegate extends System.ServiceDelegate {
-
-    private var _pendingSuccessData as Dictionary or Null = null;
 
     function initialize() {
         ServiceDelegate.initialize();
@@ -73,6 +76,7 @@ class GarminStockServiceDelegate extends System.ServiceDelegate {
                         System.println("Parsed price: " + price);
                         
                         var chartData = null;
+                        var volData = null;
                         var lastValidIndex = -1;
                         if (indicators != null) {
                             var quoteArr = indicators.get("quote") as Array;
@@ -80,18 +84,42 @@ class GarminStockServiceDelegate extends System.ServiceDelegate {
                                 var quote = quoteArr[0] as Dictionary;
                                 if (quote != null) {
                                     var closeArr = quote.get("close") as Array;
+                                    var volArr = quote.get("volume") as Array;
                                     if (closeArr != null) {
                                         // Filter nulls and convert to integer array (cap at 60 points)
                                         chartData = [];
+                                        volData = [];
                                         for (var i = 0; i < closeArr.size() && chartData.size() < 60; i++) {
                                             var val = closeArr[i] as Number or Float or Double or Null;
                                             if (val != null) {
                                                 chartData.add(val.toNumber());
+                                                var vv = (volArr != null && i < volArr.size()) ? volArr[i] : null;
+                                                volData.add(vv == null ? 0 : (vv as Number or Float or Double).toNumber());
                                                 lastValidIndex = i;
                                             }
                                         }
                                     }
                                 }
+                            }
+                        }
+
+                        // Momentum state (-2..2): direction from price change, strength from volume surge
+                        var moveState = 0;
+                        if (chartData != null && chartData.size() >= 3) {
+                            var n = chartData.size();
+                            var lastPx = chartData[n - 1];
+                            var refIdx = n - 1 - MOVE_LOOKBACK;
+                            if (refIdx < 0) { refIdx = 0; }
+                            var refPx = chartData[refIdx];
+                            var pxDelta = 0.0;
+                            if (refPx != 0) { pxDelta = (lastPx - refPx).toFloat() / refPx.toFloat(); }
+                            var volRatio = computeVolRatio(volData);
+                            if (pxDelta >= MOVE_FLAT_THRESH) {
+                                moveState = 1;
+                                if (pxDelta >= MOVE_STRONG_PX || (volRatio != null && volRatio >= MOVE_STRONG_VOL)) { moveState = 2; }
+                            } else if (pxDelta <= -MOVE_FLAT_THRESH) {
+                                moveState = -1;
+                                if (pxDelta <= -MOVE_STRONG_PX || (volRatio != null && volRatio >= MOVE_STRONG_VOL)) { moveState = -2; }
                             }
                         }
                         if (chartData != null) {
@@ -164,37 +192,11 @@ class GarminStockServiceDelegate extends System.ServiceDelegate {
                             "ticker" => tickerSymbol,
                             "time" => lastTimestamp,
                             "reg_start" => regularStart,
-                            "post_end" => postEnd
+                            "post_end" => postEnd,
+                            "move" => moveState
                         };
 
-                        // Compare the new price to the chart bounds of the preceding points to detect a breakout
-                        var sentPush = false;
-                        if (price != null && chartData != null && chartData.size() > 1) {
-                            var prevMin = (chartData as Array<Number>)[0];
-                            var prevMax = (chartData as Array<Number>)[0];
-                            for (var i = 1; i < chartData.size() - 1; i++) {
-                                var val = (chartData as Array<Number>)[i];
-                                if (val != null) {
-                                    if (prevMin == null || val < prevMin) { prevMin = val; }
-                                    if (prevMax == null || val > prevMax) { prevMax = val; }
-                                }
-                            }
-                            
-                            if (prevMin != null && prevMax != null) {
-                                if (price > prevMax) {
-                                    _pendingSuccessData = returnData;
-                                    sentPush = sendPushNotification("New high: " + price);
-                                } else if (price < prevMin) {
-                                    _pendingSuccessData = returnData;
-                                    sentPush = sendPushNotification("New low: " + price);
-                                }
-                            }
-                        }
-
-                        if (!sentPush) {
-                            System.println("Exiting background with success data");
-                            Background.exit(returnData);
-                        }
+                        Background.exit(returnData);
                         return;
                     }
                 }
@@ -206,40 +208,25 @@ class GarminStockServiceDelegate extends System.ServiceDelegate {
         Background.exit(null);
     }
 
-    function sendPushNotification(message as String) as Boolean {
-        if (PUSHOVER_APP_TOKEN.equals("your_pushover_app_token_here") || PUSHOVER_USER_KEY.equals("your_pushover_user_key_here")) {
-            System.println("Pushover credentials not configured; skipping push notification.");
-            return false;
+    // Ratio of recent (last ~5 valid bars) volume to the session average. Null if insufficient data
+    // (e.g. pre/post-market where Yahoo reports 0 volume on the 1-minute feed).
+    function computeVolRatio(volData as Array or Null) as Float or Null {
+        if (volData == null) { return null; }
+        var valid = [];
+        for (var i = 0; i < volData.size(); i++) {
+            var v = volData[i];
+            if (v != null && v > 0) { valid.add(v); }
         }
-
-        var url = "https://api.pushover.net/1/messages.json";
-        var params = {
-            "token" => PUSHOVER_APP_TOKEN,
-            "user" => PUSHOVER_USER_KEY,
-            "message" => message,
-            "title" => "Garmin Stock Alert",
-            "priority" => 1
-        };
-        var options = {
-            :method => Communications.HTTP_REQUEST_METHOD_POST,
-            :headers => {
-                "Content-Type" => Communications.REQUEST_CONTENT_TYPE_URL_ENCODED
-            },
-            :responseType => Communications.HTTP_RESPONSE_CONTENT_TYPE_JSON
-        };
-
-        Communications.makeWebRequest(
-            url,
-            params,
-            options,
-            method(:onPushResponse)
-        );
-        return true;
-    }
-
-    function onPushResponse(responseCode as Number, data as Dictionary or Null) as Void {
-        System.println("Push notification response code: " + responseCode);
-        // Now that the web request has completed, exit the background process with success data
-        Background.exit(_pendingSuccessData);
+        if (valid.size() < 6) { return null; }
+        var total = 0.0;
+        for (var i = 0; i < valid.size(); i++) { total += valid[i].toFloat(); }
+        var base = total / valid.size();
+        if (base <= 0) { return null; }
+        var rc = 5;
+        if (rc > valid.size()) { rc = valid.size(); }
+        var rTotal = 0.0;
+        for (var i = valid.size() - rc; i < valid.size(); i++) { rTotal += valid[i].toFloat(); }
+        var recent = rTotal / rc;
+        return recent / base;
     }
 }
