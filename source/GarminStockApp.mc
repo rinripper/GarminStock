@@ -26,11 +26,10 @@ class GarminStockApp extends Application.AppBase {
     function getInitialView() as [WatchUi.Views] or [WatchUi.Views, WatchUi.InputDelegates] {
         // Register background service temporal events if supported
         if (System has :ServiceDelegate) {
-            var stockData = Application.Storage.getValue("stock_data");
-            if (stockData == null) {
-                // First run: schedule immediately
-                Background.registerForTemporalEvent(new Time.Duration(5 * 60));
-            }
+            // Always (re)arm a near-term background event when the face loads, so polling recovers even if
+            // a previously scheduled temporal event was lost (e.g. after a reboot). onBackgroundData then
+            // re-adjusts the cadence for the current market session.
+            Background.registerForTemporalEvent(new Time.Duration(5 * 60));
         }
         _view = new GarminStockView();
         return [ _view ];
@@ -117,9 +116,12 @@ class GarminStockApp extends Application.AppBase {
             // Pre-market, regular, or after-hours: poll every 5 minutes.
             Background.registerForTemporalEvent(new Time.Duration(5 * 60));
         } else if (now < activeStart) {
-            // Closed, and the metadata already points at the upcoming session: sleep straight through
-            // until pre-market open — zero network calls overnight, over weekends, and on holidays.
+            // Closed, waiting for the next session. Sleep toward pre-market open, but cap each hop at one
+            // hour: a single multi-hour temporal event is unreliable on-device and can be dropped, which
+            // leaves the face not polling through pre-market. Hourly re-checks reliably converge on the
+            // 4:00 AM open (the last hop before it computes the exact remaining delay).
             var delay = activeStart - now;
+            if (delay > 3600) { delay = 3600; }
             if (delay < 300) { delay = 300; }
             Background.registerForTemporalEvent(new Time.Duration(delay));
         } else {
